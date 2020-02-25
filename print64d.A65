@@ -1,0 +1,1167 @@
+;**************************************************
+;* File: print64.6502
+;**************************************************
+;* Copyright (c) 2015 James Diffendaffer
+;*
+;*  I hereby grant an unrestricted license to use this code as long
+;*  as you give me credit for my work.
+;**************************************************
+;* Description:
+;*  Emulates a 64 character by 24 line text display using 
+;*  4 bit wide characters on a 256 * 192 graphics display.
+;*  This version is for the Acorn Atom and 6502 CPU
+;*
+;*  Contains functions to print a string at the current screen location,
+;*  print strings @ a specific screen location, line wrapping, scrolling,
+;*  clear screen, the character generator and a font.
+;*  Characters are stored with identical data in the left and right nibble
+;*  to make rendering faster and several loops have been unrolled for speed.
+;*  This code has been tested but has at least one known bug.
+;*  Assembles with the AS65 assembler included with the CC65 C compiler package.
+;*  
+;*  Derived from my MC-10 6803 code
+;**************************************************
+;* Version history
+;*  Version  Date               Description
+;*     0.14   Nov   4, 2015      Added initial support for 80 columns and Commodore Plus/4, just starting Atari demo code
+;*     0.13   Oct   6, 2015      Initial version with ability to print 2 characters at a time
+;*     0.12   Oct   3, 2015      Additional unrolling of scroll loop, more code cleanup
+;*     0.11   Oct   1, 2015      Integrated clearing last line of text display into the scroll
+;*                                 Code cleanup, inverted screen and BGColor addition
+;*     0.09   Sept 30, 2015      Changed text printing code to use EOR to save clock cycles and shorten the code.
+;*                                 Added scroll that uses unrolled column scroll for faster speed, some dead code cleanup
+;*     0.08   Sept 30, 2015      Added a CLC to the string generator code and changed CLC to SEC in print64 - Thanks Dave!
+;*     0.07   Sept 30, 2015      Added CLC in several places to fix printing, scrolling, etc.  Initial release version.
+;*     0.06   Sept 29, 2015      Converted to AS65 assembler format, fixed a lot of # and > related bugs
+;*     0.05   Sept 28, 2015      Bringing code in line with Z80 & 6803 versions
+;*	   0.04   Sept 20, 2015      Replaced LDA TAY with LDY and reordered code in left and right nibble print routines
+;*     0.03   Sept 19, 2015      Added Atom ATM file header and started Plus/4 80 column version.
+;*     0.02   Sept  9, 2015      Finished print@ and print functions
+;*	   0.01   Sept  8, 2015      Created initial 6502 character generation code
+;**************************************************
+
+.define AcornAtom	1
+.define Plus4		0
+.define Atari		0
+
+.if AcornAtom = 1
+.define ScreenAdr		$8000			; screen address of Atom
+.define	BytesPerLine	32				; screen width of RG6 mode
+.define	ScreenHeight	192				; screen height of RG6 mode
+.endif
+
+.if Plus4 = 1
+;Plus/4 support is untested and screen address calculation is incomplete
+.define ScreenAdr		$6000			; screen address of Plus/4
+.define	BytesPerLine	40				; screen width of 2 color bitmapped mode
+.define	ScreenHeight	192				; screen height
+.endif
+
+.if Atari = 1
+;this is incomplete
+.define ScreenAdr		$8150			; screen address of Atari
+.define	BytesPerLine	40				; screen width of RG6 mode
+.define	ScreenHeight	192				; screen height of RG6 mode
+.endif
+
+
+.define FontHeight		8				; number of rows high the font is on screen
+
+
+
+.define efont			EOF-font
+
+
+.define	unrollmore 1
+
+	.BSS	
+
+.ZEROPAGE				; page zero variables
+	.org	$0010		; page zero variables
+		
+string:		.res	2		; string pointer
+prntat:		.res	2		; Print @ location like Microsoft BASIC
+row:		.res	1		;
+col:		.res	1		;
+temp0:		.res	2		; temporary storage
+fscreen:	.res	2		; screen pointer for character generator
+fscreen1:	.res	2		; screen pointer for character generator
+firstchar:	.res	1
+secondchar:	.res	1
+length:		.res	2		; for 16 bit operations
+ytemp:		.res	1		; temporary storage for y
+BGColor:	.res	1		; screen background color
+
+.CODE
+.if AcornAtom = 1
+	.org	$2B00 - 22		; start 22 bytes early for header
+;****************************
+;* Acorn Atom ATM file header
+;****************************
+FNAME:		.byt	"PRINT64",0,0,0,0,0,0,0,0,0		;File Name up to 12 characters + zero padding
+ADDRESS:	.word	START			;current address is load address
+EXECADD:	.word	START			;current address is execute address
+FLENGTH:	.word	(EOF-START)		;file length = end of file value (EOF) munus start address
+;****************************
+;		org	$2B00			; free RAM on Atom
+.endif
+
+.if Plus4 = 1
+	.org	$4000-2			; start address -2 for prg header
+	.word	START			; the start address
+	
+	;DB $0B,$10,0,0,$9E,"4109",0,0,0
+.endif
+
+.if Atari = 1
+.endif
+
+START:
+
+		
+;**************************************************
+;* graphics text routine macros
+;**************************************************
+
+.macro SETVDG	value
+	lda		#value			; 6847 control - GM2 GM1 GM0 A/G 0 0 0 0
+	sta		$B000
+.endmacro
+
+.macro	PRINTAT	loc,str
+	lda #<loc
+	sta prntat
+	lda #>loc
+	sta prntat+1
+	lda #>str
+	sta string
+	lda #>str
+	sta string+1
+	jsr print_at
+.endmacro
+
+.macro PRINT	str
+	lda #<str
+	sta string
+	lda #>str
+	sta string+1
+	jsr print
+.endmacro
+
+
+.macro  inc16   addr
+.scope
+	inc	addr
+	bne	Skip
+	inc	addr+1
+Skip:
+.endscope
+.endmacro
+
+.macro  dec16   addr
+.scope
+	dec	addr
+	bne	Skip
+	dec	addr+1
+Skip:
+.endscope
+.endmacro
+
+.macro InvertFont	mfont,msize
+	lda	#<mfont
+	sta	fscreen
+	lda	#>mfont
+	sta	fscreen+1
+	lda	#<msize
+	sta	length
+	lda	#>msize
+	sta	length+1
+	jsr	invert_mem
+.endmacro
+
+
+;**************************************************
+;* NAME: textdemo
+;**************************************************
+;* DESCRIPTION:
+;*  a short program to demonstrate the use of 
+;*  routines in the graphics library
+;**************************************************
+Textdemo:
+	;save registers
+	pha
+	txa
+	pha
+	tya
+	pha
+
+.if AcornAtom = 1
+;	lda	#$FF
+	lda	#$00
+	sta	BGColor				;set the background color
+	;clear the screen before we show it
+	jsr		cls
+	;Acorn Atom
+	SETVDG(%11110000)		; 6847 control - GM2 GM1 GM0 A/G 0 0 0 0   RG6 = 11110000
+.endif
+
+.if Plus4 = 1
+	;Commodore Plus/4
+	;set hi-res graphics mode
+	lda	#$36				;%00110110
+							;from bit 7 down to bit 0
+							;0 - test bit, always 0
+							;0 - Extended Color Mode off
+							;1 - Bitmap Mode On
+							;1 - Screen On
+							;0 - 24 Rows
+							;110 - Vertical Scroll Position
+	sta	$FF06				;set it 
+	
+	lda	#$C8				;%00001000
+							;from bit 7 down to bit 0
+							;00 - Don't Care, Not Used
+							;001 - Address of Bitmap RAM
+							;000 - Frequency Voice 1
+	sta	$FF12				;set it
+; set up color RAM
+	ldx	#$00		;clear X
+@cloop:
+	lda	#$33		;%00110011
+	sta	$0800,x
+	sta	$0900,x
+	sta	$0A00,x
+	sta	$0B00,x
+	lda	#$05			;%00001001
+	sta	$0C00,x
+	sta	$0D00,x
+	sta	$0E00,x
+	sta	$0F00,x
+	dex
+	bne	@cloop
+.endif
+	
+	
+	
+	;	InvertFont(font,efont)
+;	lda	#<font
+;	sta	fscreen
+;	lda	#>font
+;	sta	fscreen+1
+;	;1344 bytes
+;	lda	#$40
+;	sta	length
+;	lda	#$06	; should be 06 by my code in the invert_mem doesn't work correctly yet
+;	sta	length+1
+;	jsr	invert_mem
+
+	
+	lda		#0
+	sta		row
+	sta		col
+	
+; 64 character/line demo, prints entire character set
+	lda		#<String
+	sta		string
+	lda		#>String
+	sta		string+1
+	ldy		#0
+	
+	lda		#' '				; the first character in the font
+@loop:
+	sta		(string),y
+	iny
+	clc
+	adc		#1					; increment a
+	cmp		#'~'+1				; are we past the last character in the font?
+	bne		@loop
+	lda		#0
+	sta		(string),y
+Endless:
+	PRINT(String)				; print the string we just built
+	clc
+	bcc	  Endless
+	
+	;restore registers
+	pla
+	tay
+	pla
+	tax
+	pla
+
+	rts
+	
+;**************************************************
+;* cls
+;**************************************************
+;* clears the Atom hi-res screen
+;**************************************************
+
+cls:
+	lda		#0
+	tax
+	lda		BGColor
+@sloop:
+	sta		ScreenAdr+0*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+1*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+2*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+3*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+4*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+5*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+6*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+7*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+8*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+9*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+10*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+11*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+12*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+13*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+14*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+15*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+16*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+17*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+18*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+19*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+20*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+21*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+22*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+23*FontHeight*BytesPerLine,x		; last line of 192 line display
+.if ScreenHeight = 200
+	sta		ScreenAdr+24*FontHeight*BytesPerLine,x		; for 200 line high display
+.endif
+	inx
+	beq		@nxt
+	jmp		@sloop
+@nxt:
+	rts
+	
+	
+;**************************************************
+;* scroll
+;**************************************************
+;* scrolls the hi-res text display
+;* Copies byte from one row to the next, then copies over that byte, etc... 
+;*  and clears bytes in the last line
+;**************************************************
+scroll:
+	ldx		#0
+@sloop:
+	lda		ScreenAdr+1*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+0*FontHeight*BytesPerLine,x
+	lda		ScreenAdr+2*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+1*FontHeight*BytesPerLine,x
+	lda		ScreenAdr+3*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+2*FontHeight*BytesPerLine,x
+	lda		ScreenAdr+4*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+3*FontHeight*BytesPerLine,x
+	lda		ScreenAdr+5*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+4*FontHeight*BytesPerLine,x
+	lda		ScreenAdr+6*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+5*FontHeight*BytesPerLine,x
+	lda		ScreenAdr+7*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+6*FontHeight*BytesPerLine,x
+	lda		ScreenAdr+8*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+7*FontHeight*BytesPerLine,x
+	lda		ScreenAdr+9*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+8*FontHeight*BytesPerLine,x
+	lda		ScreenAdr+10*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+9*FontHeight*BytesPerLine,x
+	lda		ScreenAdr+11*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+10*FontHeight*BytesPerLine,x
+	lda		ScreenAdr+12*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+11*FontHeight*BytesPerLine,x
+	lda		ScreenAdr+13*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+12*FontHeight*BytesPerLine,x
+	lda		ScreenAdr+14*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+13*FontHeight*BytesPerLine,x
+	lda		ScreenAdr+15*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+14*FontHeight*BytesPerLine,x
+	lda		ScreenAdr+16*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+15*FontHeight*BytesPerLine,x
+	lda		ScreenAdr+17*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+16*FontHeight*BytesPerLine,x
+	lda		ScreenAdr+18*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+17*FontHeight*BytesPerLine,x
+	lda		ScreenAdr+19*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+18*FontHeight*BytesPerLine,x
+	lda		ScreenAdr+20*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+19*FontHeight*BytesPerLine,x
+	lda		ScreenAdr+21*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+20*FontHeight*BytesPerLine,x
+	lda		ScreenAdr+22*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+21*FontHeight*BytesPerLine,x
+	lda		ScreenAdr+23*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+22*FontHeight*BytesPerLine,x
+.if ScreenHeight = 200
+	lda		ScreenAdr+24*FontHeight*BytesPerLine,x
+	sta		ScreenAdr+23*FontHeight*BytesPerLine,x
+.endif
+.if unrollmore = 1
+	lda		ScreenAdr+1*FontHeight*BytesPerLine+1,x
+	sta		ScreenAdr+0*FontHeight*BytesPerLine+1,x
+	lda		ScreenAdr+2*FontHeight*BytesPerLine+1,x
+	sta		ScreenAdr+1*FontHeight*BytesPerLine+1,x
+	lda		ScreenAdr+3*FontHeight*BytesPerLine+1,x
+	sta		ScreenAdr+2*FontHeight*BytesPerLine+1,x
+	lda		ScreenAdr+4*FontHeight*BytesPerLine+1,x
+	sta		ScreenAdr+3*FontHeight*BytesPerLine+1,x
+	lda		ScreenAdr+5*FontHeight*BytesPerLine+1,x
+	sta		ScreenAdr+4*FontHeight*BytesPerLine+1,x
+	lda		ScreenAdr+6*FontHeight*BytesPerLine+1,x
+	sta		ScreenAdr+5*FontHeight*BytesPerLine+1,x
+	lda		ScreenAdr+7*FontHeight*BytesPerLine+1,x
+	sta		ScreenAdr+6*FontHeight*BytesPerLine+1,x
+	lda		ScreenAdr+8*FontHeight*BytesPerLine+1,x
+	sta		ScreenAdr+7*FontHeight*BytesPerLine+1,x
+	lda		ScreenAdr+9*FontHeight*BytesPerLine+1,x
+	sta		ScreenAdr+8*FontHeight*BytesPerLine+1,x
+	lda		ScreenAdr+10*FontHeight*BytesPerLine+1,x
+	sta		ScreenAdr+9*FontHeight*BytesPerLine+1,x
+	lda		ScreenAdr+11*FontHeight*BytesPerLine+1,x
+	sta		ScreenAdr+10*FontHeight*BytesPerLine+1,x
+	lda		ScreenAdr+12*FontHeight*BytesPerLine+1,x
+	sta		ScreenAdr+11*FontHeight*BytesPerLine+1,x
+	lda		ScreenAdr+13*FontHeight*BytesPerLine+1,x
+	sta		ScreenAdr+12*FontHeight*BytesPerLine+1,x
+	lda		ScreenAdr+14*FontHeight*BytesPerLine+1,x
+	sta		ScreenAdr+13*FontHeight*BytesPerLine+1,x
+	lda		ScreenAdr+15*FontHeight*BytesPerLine+1,x
+	sta		ScreenAdr+14*FontHeight*BytesPerLine+1,x
+	lda		ScreenAdr+16*FontHeight*BytesPerLine+1,x
+	sta		ScreenAdr+15*FontHeight*BytesPerLine+1,x
+	lda		ScreenAdr+17*FontHeight*BytesPerLine+1,x
+	sta		ScreenAdr+16*FontHeight*BytesPerLine+1,x
+	lda		ScreenAdr+18*FontHeight*BytesPerLine+1,x
+	sta		ScreenAdr+17*FontHeight*BytesPerLine+1,x
+	lda		ScreenAdr+19*FontHeight*BytesPerLine+1,x
+	sta		ScreenAdr+18*FontHeight*BytesPerLine+1,x
+	lda		ScreenAdr+20*FontHeight*BytesPerLine+1,x
+	sta		ScreenAdr+19*FontHeight*BytesPerLine+1,x
+	lda		ScreenAdr+21*FontHeight*BytesPerLine+1,x
+	sta		ScreenAdr+20*FontHeight*BytesPerLine+1,x
+	lda		ScreenAdr+22*FontHeight*BytesPerLine+1,x
+	sta		ScreenAdr+21*FontHeight*BytesPerLine+1,x
+	lda		ScreenAdr+23*FontHeight*BytesPerLine+1,x
+	sta		ScreenAdr+22*FontHeight*BytesPerLine+1,x
+.if ScreenHeight = 200
+	lda		ScreenAdr+24*FontHeight*BytesPerLine+1,x
+	sta		ScreenAdr+23*FontHeight*BytesPerLine+1,x
+.endif
+.endif
+
+	lda		BGColor			; clear last line
+.if ScreenHeight = 192
+	sta		ScreenAdr+23*FontHeight*BytesPerLine,x
+.endif
+.if ScreenHeight = 200
+	sta		ScreenAdr+24*FontHeight*BytesPerLine,x
+.endif
+.if unrollmore = 1
+.if ScreenHeight = 192
+	sta		ScreenAdr+23*FontHeight*BytesPerLine+1,x
+.endif
+.if ScreenHeight = 200
+	sta		ScreenAdr+24*FontHeight*BytesPerLine+1,x
+.endif
+	inx
+.endif
+	inx
+	beq		@nxt
+	jmp		@sloop
+@nxt:
+	rts
+
+
+;**************************************************
+;* invert_mem
+;**************************************************
+;*  length contains the length
+;**************************************************
+invert_mem:
+	ldy		#0
+nxtaddr:
+	lda		(fscreen),y					; get original byte
+	eor		#$FF						; invert it
+	sta		(fscreen),y					; write it back
+
+	inc16	fscreen
+	dec16	length
+	bne		nxtaddr
+	
+	rts
+	
+	
+;**************************************************
+;* print_at
+;**************************************************
+;* Prints a string at a screen location
+;* works similar to print@ in Microsoft BASIC
+;*  prntat contains @ location
+;*  string contains string pointer
+;* falls through to _print
+;**************************************************
+print_at:
+	lda		prntat				;
+	and		#%00111111			;mask off row bits    (BytesPerLine*2)-1
+	sta		col					;save the column
+	lda		prntat				;copy LSB
+	and		#%11000000			;mask off column bits    254-(BytesPerLine*2)
+	asl							;rotate bits into bottom of a
+	asl							;rol?
+	asl
+	sta		row					;
+	lda		prntat+1
+	asl
+	asl
+;	clc
+	adc		row
+	sta		row					;save row info
+	
+	
+;**************************************************
+;* print
+;**************************************************
+;* Prints a zero terminated string at the current x,y location
+;*  string contains the string pointer
+;* maximum sting length is 256
+;**************************************************
+print:
+	ldy		#0
+prn1:
+	lda		col
+	lsr
+	bcs		print1
+	;try to print 2 characters at a time
+	lda		(string),y
+	cmp		#0					; strings are zero terminated
+	beq		_printexit
+	iny
+	lda		(string),y
+	dey
+	cmp		#0					; strings are zero terminated
+	beq		print1a
+	; if we get here, we can print 2 characters at once
+	sty		ytemp
+	jsr		print_642
+	ldy		ytemp
+	iny
+	inc		col
+	clc							;branch always
+	bcc		print2a				;since we are writing two at once, we know we can't go two past the end of the line
+	
+print1:
+	lda		(string),y			; get a character from the string
+	cmp		#0					; strings are zero terminated
+	beq		_printexit			; exit if it's a zero
+
+print1a:
+	sty		ytemp				; save x
+	jsr		print_64			; print the character
+	ldy		ytemp				; restore x
+
+	;update column, row, and scroll when needed
+print2a:
+	inc		col					; next column
+	lda		col					; get column
+	cmp		#BytesPerLine*2		; BytesPerLine characters per line (0 - BytesPerLine*2-1)
+;	cmp		#64					; 64 chars / line (0-63)
+	bcc		_cexit				; is column past the end of a line?
+
+	lda		#0
+	sta		col					; set column to zero
+
+	inc		row					; incrament row
+	lda		row					; get row
+	cmp		#24					;(ScreenHeight/8)	; 24 lines (0-23)
+	bcc		_cexit				; branch if row isn't past the end of the screen
+
+	dec		row					; reduce row back to last line
+
+	sty		ytemp				; save x
+	jsr		scroll				; scroll the screen
+	ldy		ytemp				; restore x
+
+_cexit:	
+	iny							; increment the string pointer y
+	bne		prn1				; keep printing
+
+	inc		string+1			; update string pointer MSB
+	bne		prn1				; keep printing
+
+_printexit:						; we are done
+	
+	rts
+
+	
+;**************************************************
+; NAME: print_64
+;**************************************************
+;* Description:
+;*  64 Column text display driver
+;*  Routine does not print at pixel X,Y but
+;*  prints at a character position.
+;**************************************************
+print_64:
+	; register a contains character
+	sec
+	sbc		#' '				; printable character set data starts at space, ASCII 32
+	tax							; save as character table offset
+
+.if BytesPerLine = 32
+	; point screen to $8000 + row (base screen addr-ess + row)
+	lda		#>ScreenAdr
+;	lda		#$80
+	clc
+	adc		row					; adding row to MSB = 256 * row
+	sta		fscreen+1
+
+	ldy		#0					; top line is always black (1st byte of the font)
+								; start at zero offset from screen address
+	
+	; put the lowest bit in the carry so we know if it's left or right nibble
+	lda		col					; 2 columns / byte
+	lsr
+
+	bcs		rightnibble
+.endif
+
+.if BytesPerLine = 40
+.if Plus4
+; col addition requires multiply by 8 due to the byte order of the screen and
+; divide by 2 for two characters per byte, so col * 4
+; any col over 64 requires 2 bytes added to screen address anyway, so make another table
+
+	; calculate screen address based on row and column
+	clc
+	ldy		row					; put row offset in y
+	lda		scrtableLSB,y		; get screen row address MSB from table
+	ldy		col					; put col index in y
+	adc		coltableLSB,y		; get LSB from column table
+	sta		fscreen				; store LSB of screen address
+	ldy		row					; put row offset in y
+	lda		scrtableMSB,y		; get screen row address MSB from table
+	ldy		col					; put col index in y
+	adc		coltableMSB,y		; get MSB from column table
+	sta		fscreen+1			; store MSB of screen address
+
+	tya							; put column in a
+	
+	ldy		#0					; top line is always black (1st byte of the font)
+								; start at zero offset from screen address
+
+	lsr							; even or odd column?
+	bcs		rightnibble
+.else
+	ldy		row					; put row offset in y
+
+;	clc							; carry should be clear from asl
+	lda		col
+	lsr
+	adc		scrtable,y			; get LSB offset from table
+	sta		fscreen				; store LSB
+	lda		#0
+	adc		scrtable+1,y		; get MSB offset from table and add carry
+	sta		fscreen+1			; store MSB
+
+	ldy		#0					; top line is always black (1st byte of the font)
+								; start at zero offset from screen address
+	lda		col
+	lsr
+	bcs		rightnibble
+.endif
+.endif
+
+	
+;**************************************************
+;* left nibble 
+;**************************************************
+leftnibble:
+	lda		BGColor
+	sta		(fscreen),y			; write to the screen
+
+.if Plus4 = 1
+	iny							; point to next screen byte
+.else
+	ldy		#BytesPerLine*1		;point to next screen byte
+.endif
+	lda		(fscreen),y
+;	eor		FCol1,X				; EOR with the next byte of the font
+;	and		#%00001111
+	eor		FCol1,X				; EOR with the next byte of the font	
+	sta		(fscreen),y
+
+.if Plus4 = 1
+	iny							; point to next screen byte
+.else
+	ldy		#BytesPerLine*2		;point to next screen byte
+.endif
+	lda		(fscreen),y
+;	eor		FCol2,X				; EOR with the next byte of the font
+;	and		#%00001111
+	eor		FCol2,X				; EOR with the next byte of the font	
+	sta		(fscreen),y
+	
+.if Plus4 = 1
+	iny							; point to next screen byte
+.else
+	ldy		#BytesPerLine*3		;point to next screen byte
+.endif
+	lda		(fscreen),y
+;	eor		FCol3,X				; EOR with the next byte of the font
+;	and		#%00001111
+	eor		FCol3,X				; EOR with the next byte of the font	
+	sta		(fscreen),y
+	
+.if Plus4 = 1
+	iny							; point to next screen byte
+.else
+	ldy		#BytesPerLine*4		;point to next screen byte
+.endif
+	lda		(fscreen),y
+;	eor		FCol4,X				; EOR with the next byte of the font
+;	and		#%00001111
+	eor		FCol4,X				; EOR with the next byte of the font	
+	sta		(fscreen),y
+
+.if Plus4 = 1
+	iny							; point to next screen byte
+.else
+	ldy		#BytesPerLine*5		;point to next screen byte
+.endif
+	lda		(fscreen),y
+;	eor		FCol5,X				; EOR with the next byte of the font
+;	and		#%00001111
+	eor		FCol5,X				; EOR with the next byte of the font	
+	sta		(fscreen),y
+	
+.if Plus4 = 1
+	iny							; point to next screen byte
+.else
+	ldy		#BytesPerLine*6		;point to next screen byte
+.endif
+	lda		(fscreen),y
+;	eor		FCol6,X				; EOR with the next byte of the font
+;	and		#%00001111
+	eor		FCol6,X				; EOR with the next byte of the font	
+	sta		(fscreen),y
+	
+.if Plus4 = 1
+	iny							; point to next screen byte
+.else
+.if BytesPerLine = 32
+	ldy		#BytesPerLine*7		;point to next screen byte
+.endif
+.if BytesPerLine = 40
+	;clc
+	lda		fscreen				; point to next screen byte
+	adc		#BytesPerLine
+	sta		fscreen				; LSB
+	lda		#0
+	adc		fscreen+1			; MSB
+	sta		fscreen+1
+.endif
+.endif
+	lda		(fscreen),y
+;	eor		FCol7,X				; EOR with the next byte of the font
+;	and		#%00001111
+	eor		FCol7,X				; EOR with the next byte of the font	
+	sta		(fscreen),y
+	
+	rts
+	
+	
+;**************************************************
+; right nibble
+;**************************************************
+rightnibble:
+	lda		BGColor
+	sta		(fscreen),y			; write to the screen
+
+.if Plus4 = 1
+	iny							; point to next screen byte
+.else
+	ldy		#BytesPerLine*1		;point to next screen byte
+.endif
+	lda		(fscreen),y
+;	eor		FCol21,X			; EOR with the next byte of the font
+;	and		#%11110000
+	eor		FCol21,X			; EOR with the next byte of the font	
+	sta		(fscreen),y
+
+.if Plus4 = 1
+	iny							; point to next screen byte
+.else
+	ldy		#BytesPerLine*2		;point to next screen byte
+.endif
+	lda		(fscreen),y
+;	eor		FCol22,X			; EOR with the next byte of the font
+;	and		#%11110000
+	eor		FCol22,X			; EOR with the next byte of the font	
+	sta		(fscreen),y
+	
+.if Plus4 = 1
+	iny							; point to next screen byte
+.else
+	ldy		#BytesPerLine*3		;point to next screen byte
+.endif
+	lda		(fscreen),y
+;	eor		FCol23,X			; EOR with the next byte of the font
+;	and		#%11110000
+	eor		FCol23,X			; EOR with the next byte of the font	
+	sta		(fscreen),y
+	
+.if Plus4 = 1
+	iny							; point to next screen byte
+.else
+	ldy		#BytesPerLine*4		;point to next screen byte
+.endif
+	lda		(fscreen),y
+;	eor		FCol24,X			; EOR with the next byte of the font
+;	and		#%11110000
+	eor		FCol24,X			; EOR with the next byte of the font	
+	sta		(fscreen),y
+
+.if Plus4 = 1
+	iny							; point to next screen byte
+.else
+	ldy		#BytesPerLine*5		;point to next screen byte
+.endif
+	lda		(fscreen),y
+;	eor		FCol25,X			; EOR with the next byte of the font
+;	and		#%11110000
+	eor		FCol25,X			; EOR with the next byte of the font	
+	sta		(fscreen),y
+	
+.if Plus4 = 1
+	iny							; point to next screen byte
+.else
+	ldy		#BytesPerLine*6		;point to next screen byte
+.endif
+	lda		(fscreen),y
+;	eor		FCol26,X			; EOR with the next byte of the font
+;	and		#%11110000
+	eor		FCol26,X			; EOR with the next byte of the font	
+	sta		(fscreen),y
+	
+
+.if Plus4 = 1
+	iny							; point to next screen byte
+.else
+.if BytesPerLine = 32
+	ldy		#BytesPerLine*7		;point to next screen byte
+.endif
+.if BytesPerLine = 40
+	;clc
+	lda		fscreen				; point to next screen byte
+	adc		#BytesPerLine
+	sta		fscreen				; LSB
+	lda		#0
+	adc		fscreen+1			; MSB
+	sta		fscreen+1
+.endif
+.endif
+	lda		(fscreen),y
+;	eor		FCol27,X			; EOR with the next byte of the font
+;	and		#%11110000
+	eor		FCol27,X			; EOR with the next byte of the font	
+	sta		(fscreen),y
+	
+	rts
+
+;**************************************************
+; write two characters at once
+;**************************************************
+print_642:
+	; register a contains character
+	lda		(string),y
+	sec
+	sbc		#' '				; printable character set data starts at space, ASCII 32
+	sta		firstchar			; save as character table offset
+
+	iny
+	lda		(string),y
+	sec
+	sbc		#' '
+	sta		secondchar
+	
+.if BytesPerLine = 32
+	; point screen to $8000 + row (base screen address + row)
+	lda		#>ScreenAdr
+;	lda		#$80
+	clc
+	adc		row					; adding row to MSB = 256 * row
+	sta		fscreen+1
+
+	ldy		#0					; top line is always black (1st byte of the font)
+								; start at zero offset from screen address
+	
+	; add the column
+	lda		col					; 2 columns / byte
+	lsr
+	sta		fscreen				; save it
+.endif
+
+.if BytesPerLine = 40
+	lda		row
+	asl							; * 2 for word sized table (row max of 25 * 2)
+	tax							; put offset in x
+
+;	clc							; carry should be clear from asl
+	lda		col
+	lsr
+	adc		scrtable,X			; get LSB offset from table
+	sta		fscreen				; store LSB
+	lda		scrtable+1,X		; get MSB offset from table
+	adc		#0					; add carry
+	sta		fscreen+1			; store MSB
+.endif
+
+twochar:
+	lda		BGColor
+	sta		(fscreen),y			; write to the screen
+
+.if Plus4 = 1
+	iny							; point to next screen byte
+.else
+	ldy		#BytesPerLine*1		; point to next screen byte
+.endif
+	ldx		firstchar			; offset to 1st character
+	lda		FCol1,X				; load the next byte of the 1st character
+	ldx		secondchar			; offset to 2nd character
+	eor		FCol21,X			; add the next byte of the 2nd character
+	sta		(fscreen),y			; write it to the screen
+
+.if Plus4 = 1
+	iny							; point to next screen byte
+.else
+	ldy		#BytesPerLine*2		;point to next screen byte
+.endif
+	lda		FCol22,X			; add the next byte of the 2nd character
+	ldx		firstchar			; offset to 1st character
+	eor		FCol2,X				; load the next byte of the 1st character
+	sta		(fscreen),y			; write it to the screen
+	
+.if Plus4 = 1
+	iny							; point to next screen byte
+.else
+	ldy		#BytesPerLine*3		;point to next screen byte
+.endif
+	lda		FCol3,X				; load the next byte of the 1st character
+	ldx		secondchar			; offset to 2nd character
+	eor		FCol23,X			; add the next byte of the 2nd character
+	sta		(fscreen),y			; write it to the screen
+	
+.if Plus4 = 1
+	iny							; point to next screen byte
+.else
+	ldy		#BytesPerLine*4		;point to next screen byte
+.endif
+	lda		FCol24,X			; add the next byte of the 2nd character
+	ldx		firstchar			; offset to 1st character
+	eor		FCol4,X				; load the next byte of the 1st character
+	sta		(fscreen),y			; write it to the screen
+
+.if Plus4 = 1
+	iny							; point to next screen byte
+.else
+	ldy		#BytesPerLine*5		;point to next screen byte
+.endif
+	lda		FCol5,X				; load the next byte of the 1st character
+	ldx		secondchar			; offset to 2nd character
+	eor		FCol25,X			; add the next byte of the 2nd character
+	sta		(fscreen),y			; write it to the screen
+	
+.if Plus4 = 1
+	iny							; point to next screen byte
+.else
+	ldy		#BytesPerLine*6		;point to next screen byte
+.endif
+	lda		FCol26,X			; add the next byte of the 2nd character
+	ldx		firstchar			; offset to 1st character
+	eor		FCol6,X				; load the next byte of the 1st character
+	sta		(fscreen),y			; write it to the screen
+	
+.if Plus4 = 1
+	iny							; point to next screen byte
+.else
+.if BytesPerLine = 32
+	ldy		#BytesPerLine*7		;point to next screen byte
+.endif
+.if BytesPerLine = 40
+	;clc
+	lda		fscreen				; point to next screen byte
+	adc		#BytesPerLine
+	sta		fscreen				; LSB
+	lda		#0
+	adc		fscreen+1			; MSB
+	sta		fscreen+1
+.endif
+.endif
+	lda		FCol7,X				; load the next byte of the 1st character
+	ldx		secondchar			; offset to 2nd character
+	eor		FCol27,X			; add the next byte of the 2nd character
+	sta		(fscreen),y			; write it to the screen
+	
+	rts
+
+.if BytesPerLine = 40	
+;**************************************************
+; 80 column address lookup table
+;**************************************************
+scrtableLSB:
+	.byte	<ScreenAdr+BytesPerLine*8*0, <ScreenAdr+BytesPerLine*8*1, <ScreenAdr+BytesPerLine*8*2, <ScreenAdr+BytesPerLine*8*3, <ScreenAdr+BytesPerLine*8*4
+	.byte	<ScreenAdr+BytesPerLine*8*5, <ScreenAdr+BytesPerLine*8*6, <ScreenAdr+BytesPerLine*8*7, <ScreenAdr+BytesPerLine*8*8, <ScreenAdr+BytesPerLine*8*9
+	.byte	<ScreenAdr+BytesPerLine*8*10, <ScreenAdr+BytesPerLine*8*11, <ScreenAdr+BytesPerLine*8*12, <ScreenAdr+BytesPerLine*8*13, <ScreenAdr+BytesPerLine*8*14
+	.byte	<ScreenAdr+BytesPerLine*8*15, <ScreenAdr+BytesPerLine*8*16, <ScreenAdr+BytesPerLine*8*17, <ScreenAdr+BytesPerLine*8*18, <ScreenAdr+BytesPerLine*8*19
+	.byte	<ScreenAdr+BytesPerLine*8*20, <ScreenAdr+BytesPerLine*8*21, <ScreenAdr+BytesPerLine*8*22, <ScreenAdr+BytesPerLine*8*23, <ScreenAdr+BytesPerLine*8*24
+scrtableMSB:
+	.byte	>ScreenAdr+BytesPerLine*8*0, >ScreenAdr+BytesPerLine*8*1, >ScreenAdr+BytesPerLine*8*2, >ScreenAdr+BytesPerLine*8*3, >ScreenAdr+BytesPerLine*8*4
+	.byte	>ScreenAdr+BytesPerLine*8*5, >ScreenAdr+BytesPerLine*8*6, >ScreenAdr+BytesPerLine*8*7, >ScreenAdr+BytesPerLine*8*8, >ScreenAdr+BytesPerLine*8*9
+	.byte	>ScreenAdr+BytesPerLine*8*10, >ScreenAdr+BytesPerLine*8*11, >ScreenAdr+BytesPerLine*8*12, >ScreenAdr+BytesPerLine*8*13, >ScreenAdr+BytesPerLine*8*14
+	.byte	>ScreenAdr+BytesPerLine*8*15, >ScreenAdr+BytesPerLine*8*16, >ScreenAdr+BytesPerLine*8*17, >ScreenAdr+BytesPerLine*8*18, >ScreenAdr+BytesPerLine*8*19
+	.byte	>ScreenAdr+BytesPerLine*8*20, >ScreenAdr+BytesPerLine*8*21, >ScreenAdr+BytesPerLine*8*22, >ScreenAdr+BytesPerLine*8*23, >ScreenAdr+BytesPerLine*8*24
+.endif
+
+.if Plus4
+; Plus4 column offset.  I use Font Height but this must be fixed at 8 for the Plus4 screen layout
+; format  column left nibble offset, column right nibble offset (both are the same), next...
+; doubling info lets us replace lda col, lsr, tay  with ldy
+coltableLSB:
+	.byte	<FontHeight*0,<FontHeight*0, <FontHeight*1,<FontHeight*1, <FontHeight*2,<FontHeight*2, <FontHeight*3,<FontHeight*3
+	.byte	<FontHeight*4,<FontHeight*4, <FontHeight*5,<FontHeight*5, <FontHeight*6,<FontHeight*6, <FontHeight*7,<FontHeight*7
+	.byte	<FontHeight*8,<FontHeight*8, <FontHeight*9,<FontHeight*9, <FontHeight*10,<FontHeight*10, <FontHeight*11,<FontHeight*11
+	.byte	<FontHeight*12,<FontHeight*12, <FontHeight*13,<FontHeight*13, <FontHeight*14,<FontHeight*14, <FontHeight*15,<FontHeight*15
+	.byte	<FontHeight*16,<FontHeight*16, <FontHeight*17,<FontHeight*17, <FontHeight*18,<FontHeight*18, <FontHeight*19,<FontHeight*19
+	.byte	<FontHeight*20,<FontHeight*20, <FontHeight*21,<FontHeight*21, <FontHeight*22,<FontHeight*22, <FontHeight*23,<FontHeight*23
+	.byte	<FontHeight*24,<FontHeight*24, <FontHeight*25,<FontHeight*25, <FontHeight*26,<FontHeight*26, <FontHeight*27,<FontHeight*27
+	.byte	<FontHeight*28,<FontHeight*28, <FontHeight*29,<FontHeight*29, <FontHeight*30,<FontHeight*30, <FontHeight*31,<FontHeight*31
+	.byte	<FontHeight*32,<FontHeight*32, <FontHeight*33,<FontHeight*33, <FontHeight*34,<FontHeight*34, <FontHeight*35,<FontHeight*35
+	.byte	<FontHeight*36,<FontHeight*36, <FontHeight*37,<FontHeight*37, <FontHeight*38,<FontHeight*38, <FontHeight*39,<FontHeight*39
+coltableMSB:
+	.byte	>FontHeight*0,>FontHeight*0, >FontHeight*1,>FontHeight*1, >FontHeight*2,>FontHeight*2, >FontHeight*3,>FontHeight*3
+	.byte	>FontHeight*4,>FontHeight*4, >FontHeight*5,>FontHeight*5, >FontHeight*6,>FontHeight*6, >FontHeight*7,>FontHeight*7
+	.byte	>FontHeight*8,>FontHeight*8, >FontHeight*9,>FontHeight*9, >FontHeight*10,>FontHeight*10, >FontHeight*11,>FontHeight*11
+	.byte	>FontHeight*12,>FontHeight*12, >FontHeight*13,>FontHeight*13, >FontHeight*14,>FontHeight*14, >FontHeight*15,>FontHeight*15
+	.byte	>FontHeight*16,>FontHeight*16, >FontHeight*17,>FontHeight*17, >FontHeight*18,>FontHeight*18, >FontHeight*19,>FontHeight*19
+	.byte	>FontHeight*20,>FontHeight*20, >FontHeight*21,>FontHeight*21, >FontHeight*22,>FontHeight*22, >FontHeight*23,>FontHeight*23
+	.byte	>FontHeight*24,>FontHeight*24, >FontHeight*25,>FontHeight*25, >FontHeight*26,>FontHeight*26, >FontHeight*27,>FontHeight*27
+	.byte	>FontHeight*28,>FontHeight*28, >FontHeight*29,>FontHeight*29, >FontHeight*30,>FontHeight*30, >FontHeight*31,>FontHeight*31
+	.byte	>FontHeight*32,>FontHeight*32, >FontHeight*33,>FontHeight*33, >FontHeight*34,>FontHeight*34, >FontHeight*35,>FontHeight*35
+	.byte	>FontHeight*36,>FontHeight*36, >FontHeight*37,>FontHeight*37, >FontHeight*38,>FontHeight*38, >FontHeight*39,>FontHeight*39
+.endif	
+
+;**************************************************
+; HALF WIDTH 4x8 FONT
+0; Top row is always zero and not stored (336 bytes)
+; characters are 4 bits wide and 7 bits high 
+; (the top row is always blank)
+; There are two characters stored in each group of
+; 7 bytes.  Each byte has bits for one character in
+; the high nibble and bits for another in the low nibble
+; Font borrowed from Sinclair Spectrum code
+;**************************************************
+font:
+FCol1:
+	.byte	$00, $20, $50, $20, $20, $50, $20, $20, $10, $40, $20, $00, $00, $00, $00, $10
+	.byte	$20, $20, $20, $70, $50, $70, $10, $70, $20, $20, $00, $00, $00, $00, $00, $20
+	.byte	$20, $30, $60, $30, $60, $70, $70, $30, $50, $70, $30, $50, $40, $50, $60, $20
+	.byte	$60, $20, $60, $30, $70, $50, $50, $50, $50, $50, $70, $30, $40, $60, $20, $00
+	.byte	$20, $00, $40, $00, $10, $00, $10, $00, $40, $20, $10, $40, $60, $00, $00, $00
+	.byte	$00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $10, $20, $40, $50, $60
+FCol21:
+	.byte	$00, $02, $05, $02, $02, $05, $02, $02, $01, $04, $02, $00, $00, $00, $00, $01
+	.byte	$02, $02, $02, $07, $05, $07, $01, $07, $02, $02, $00, $00, $00, $00, $00, $02
+	.byte	$02, $03, $06, $03, $06, $07, $07, $03, $05, $07, $03, $05, $04, $05, $06, $02
+	.byte	$06, $02, $06, $03, $07, $05, $05, $05, $05, $05, $07, $03, $04, $06, $02, $00
+	.byte	$02, $00, $04, $00, $01, $00, $01, $00, $04, $02, $01, $04, $06, $00, $00, $00
+	.byte	$00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $01, $02, $04, $05, $06
+FCol2:
+	.byte	$00, $20, $50, $70, $70, $10, $40, $20, $20, $20, $70, $00, $00, $00, $00, $10
+	.byte	$50, $60, $50, $10, $50, $40, $20, $10, $50, $50, $00, $00, $10, $00, $40, $50
+	.byte	$50, $50, $50, $40, $50, $40, $40, $40, $50, $20, $10, $50, $40, $70, $50, $50
+	.byte	$50, $50, $50, $40, $20, $50, $50, $50, $50, $50, $10, $20, $40, $20, $50, $00
+	.byte	$10, $00, $40, $00, $10, $00, $20, $00, $40, $00, $00, $40, $20, $00, $00, $00
+	.byte	$00, $00, $00, $00, $20, $00, $00, $00, $00, $00, $00, $20, $20, $20, $a0, $90
+FCol22:
+	.byte	$00, $02, $05, $07, $07, $01, $04, $02, $02, $02, $07, $00, $00, $00, $00, $01
+	.byte	$05, $06, $05, $01, $05, $04, $02, $01, $05, $05, $00, $00, $01, $00, $04, $05
+	.byte	$05, $05, $05, $04, $05, $04, $04, $04, $05, $02, $01, $05, $04, $07, $05, $05
+	.byte	$05, $05, $05, $04, $02, $05, $05, $05, $05, $05, $01, $02, $04, $02, $05, $00
+	.byte	$01, $00, $04, $00, $01, $00, $02, $00, $04, $00, $00, $04, $02, $00, $00, $00
+	.byte	$00, $00, $00, $00, $02, $00, $00, $00, $00, $00, $00, $02, $02, $02, $0a, $09
+FCol3:
+	.byte	$00, $20, $00, $20, $60, $20, $30, $00, $40, $10, $20, $20, $00, $00, $00, $20
+	.byte	$50, $20, $10, $20, $50, $60, $60, $10, $20, $50, $20, $20, $20, $70, $20, $10
+	.byte	$70, $50, $60, $40, $50, $60, $60, $40, $70, $20, $10, $60, $40, $50, $50, $50
+	.byte	$50, $50, $50, $20, $20, $50, $50, $50, $20, $50, $20, $20, $20, $20, $00, $00
+	.byte	$00, $30, $60, $30, $30, $20, $70, $30, $60, $60, $30, $50, $20, $50, $60, $20
+	.byte	$60, $30, $50, $30, $70, $50, $50, $50, $50, $50, $70, $20, $20, $20, $00, $60
+FCol23:
+	.byte	$00, $02, $00, $02, $06, $02, $03, $00, $04, $01, $02, $02, $00, $00, $00, $02
+	.byte	$05, $02, $01, $02, $05, $06, $06, $01, $02, $05, $02, $02, $02, $07, $02, $01
+	.byte	$07, $05, $06, $04, $05, $06, $06, $04, $07, $02, $01, $06, $04, $05, $05, $05
+	.byte	$05, $05, $05, $02, $02, $05, $05, $05, $02, $05, $02, $02, $02, $02, $00, $00
+	.byte	$00, $03, $06, $03, $03, $02, $07, $03, $06, $06, $03, $05, $02, $05, $06, $02
+	.byte	$06, $03, $05, $03, $07, $05, $05, $05, $05, $05, $07, $02, $02, $02, $00, $06
+FCol4:
+	.byte	$00, $20, $00, $20, $30, $20, $50, $00, $40, $10, $50, $70, $00, $70, $00, $20
+	.byte	$50, $20, $20, $10, $70, $10, $50, $20, $50, $30, $00, $00, $40, $00, $10, $20
+	.byte	$70, $70, $50, $40, $50, $40, $40, $50, $50, $20, $50, $50, $40, $50, $50, $50
+	.byte	$60, $50, $60, $10, $20, $50, $50, $50, $20, $20, $20, $20, $20, $20, $00, $00
+	.byte	$00, $50, $50, $40, $50, $50, $20, $50, $50, $20, $10, $60, $20, $70, $50, $50
+	.byte	$50, $50, $60, $60, $20, $50, $50, $50, $20, $50, $30, $40, $20, $10, $00, $40
+FCol24:
+	.byte	$00, $02, $00, $02, $03, $02, $05, $00, $04, $01, $05, $07, $00, $07, $00, $02
+	.byte	$05, $02, $02, $01, $07, $01, $05, $02, $05, $03, $00, $00, $04, $00, $01, $02
+	.byte	$07, $07, $05, $04, $05, $04, $04, $05, $05, $02, $05, $05, $04, $05, $05, $05
+	.byte	$06, $05, $06, $01, $02, $05, $05, $05, $02, $02, $02, $02, $02, $02, $00, $00
+	.byte	$00, $05, $05, $04, $05, $05, $02, $05, $05, $02, $01, $06, $02, $07, $05, $05
+	.byte	$05, $05, $06, $06, $02, $05, $05, $05, $02, $05, $03, $04, $02, $01, $00, $04
+FCol5:
+	.byte	$00, $00, $00, $70, $70, $40, $50, $00, $40, $10, $00, $20, $00, $00, $00, $40
+	.byte	$50, $20, $40, $50, $10, $50, $50, $20, $50, $20, $00, $00, $20, $70, $20, $00
+	.byte	$40, $50, $50, $40, $50, $40, $40, $50, $50, $20, $50, $50, $40, $50, $50, $50
+	.byte	$40, $50, $50, $50, $20, $50, $20, $70, $50, $20, $40, $20, $10, $20, $00, $00
+	.byte	$00, $50, $50, $40, $50, $60, $20, $50, $50, $20, $10, $50, $20, $50, $50, $50
+	.byte	$50, $50, $40, $30, $20, $50, $20, $70, $20, $50, $60, $20, $20, $20, $00, $60
+FCol25:
+	.byte	$00, $00, $00, $07, $07, $04, $05, $00, $04, $01, $00, $02, $00, $00, $00, $04
+	.byte	$05, $02, $04, $05, $01, $05, $05, $02, $05, $02, $00, $00, $02, $07, $02, $00
+	.byte	$04, $05, $05, $04, $05, $04, $04, $05, $05, $02, $05, $05, $04, $05, $05, $05
+	.byte	$04, $05, $05, $05, $02, $05, $02, $07, $05, $02, $04, $02, $01, $02, $00, $00
+	.byte	$00, $05, $05, $04, $05, $06, $02, $05, $05, $02, $01, $05, $02, $05, $05, $05
+	.byte	$05, $05, $04, $03, $02, $05, $02, $07, $02, $05, $06, $02, $02, $02, $00, $06
+FCol6:
+	.byte	$00, $20, $00, $20, $20, $50, $30, $00, $20, $20, $00, $00, $20, $00, $10, $40
+	.byte	$20, $70, $70, $20, $10, $20, $20, $20, $20, $40, $20, $20, $10, $00, $40, $20
+	.byte	$30, $50, $60, $30, $60, $70, $40, $30, $50, $70, $20, $50, $70, $50, $50, $20
+	.byte	$40, $30, $50, $20, $20, $20, $20, $50, $50, $20, $70, $20, $10, $20, $00, $00
+	.byte	$00, $30, $60, $30, $30, $30, $40, $30, $50, $70, $50, $50, $70, $50, $50, $20
+	.byte	$60, $30, $40, $60, $10, $20, $20, $50, $50, $30, $70, $20, $20, $20, $00, $90
+FCol26:
+	.byte	$00, $02, $00, $02, $02, $05, $03, $00, $02, $02, $00, $00, $02, $00, $01, $04
+	.byte	$02, $07, $07, $02, $01, $02, $02, $02, $02, $04, $02, $02, $01, $00, $04, $02
+	.byte	$03, $05, $06, $03, $06, $07, $04, $03, $05, $07, $02, $05, $07, $05, $05, $02
+	.byte	$04, $03, $05, $02, $02, $02, $02, $05, $05, $02, $07, $02, $01, $02, $00, $00
+	.byte	$00, $03, $06, $03, $03, $03, $04, $03, $05, $07, $05, $05, $07, $05, $05, $02
+	.byte	$06, $03, $04, $06, $01, $02, $02, $05, $05, $03, $07, $02, $02, $02, $00, $09
+FCol7:
+	.byte	$00, $00, $00, $00, $00, $00, $00, $00, $10, $40, $00, $00, $20, $00, $00, $00
+	.byte	$00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $20, $00, $00, $00, $00
+	.byte	$00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00
+	.byte	$00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $30, $00, $60, $00, $F0
+	.byte	$00, $00, $00, $00, $00, $00, $00, $66, $00, $00, $20, $00, $00, $00, $00, $00
+	.byte	$40, $10, $00, $00, $00, $00, $00, $00, $00, $60, $00, $10, $00, $40, $00, $60
+FCol27:
+	.byte	$00, $00, $00, $00, $00, $00, $00, $00, $01, $04, $00, $00, $02, $00, $00, $00
+	.byte	$00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $02, $00, $00, $00, $00
+	.byte	$00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00
+	.byte	$00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $03, $00, $06, $00, $0F
+	.byte	$00, $00, $00, $00, $00, $00, $00, $06, $00, $00, $02, $00, $00, $00, $00, $00
+	.byte	$04, $01, $00, $00, $00, $00, $00, $00, $00, $06, $00, $01, $00, $04, $00, $06
+EOF:
+
+	.bss	
+String:	.res	256
+
+	.END
